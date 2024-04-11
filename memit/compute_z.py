@@ -10,6 +10,7 @@ from util import nethook
 
 from .memit_hparams import MEMITHyperParams
 
+V_GRAD_STEPS = 30
 
 def compute_z(
     model: AutoModelForCausalLM,
@@ -104,7 +105,7 @@ def compute_z(
     nethook.set_requires_grad(False, model)
 
     # Execute optimization
-    for it in range(hparams.v_num_grad_steps):
+    for it in range(V_GRAD_STEPS):
         opt.zero_grad()
 
         # Forward propagation
@@ -144,16 +145,7 @@ def compute_z(
         ).squeeze(2)
         mask = (rewriting_targets != -100).float()
 
-        ### def entropy
-        def entropy(probs):
-            # Ensure the probabilities are positive and sum to 1
-            probs = probs.clamp(min=1e-9)  # Avoid log(0) by ensuring probs are never 0
-            log_probs = torch.log(probs)  # Compute log of probabilities
-            entropy = -torch.sum(probs * log_probs, dim=1)  # Compute entropy
-            return entropy.mean()
-            
         ### Compute max entropy loss
-        print('Calculating entropy loss')
         logits = ln_f(full_repr) @ lm_w + lm_b
         
         # get logits for last target token
@@ -164,14 +156,15 @@ def compute_z(
         original_indices = original_indices.unsqueeze(-1).unsqueeze(-1)
         expanded_indices = original_indices.expand(-1, -1, logits.size(2))
         target_logits = torch.gather(logits, 1, expanded_indices).squeeze(1)
-        target_probs = F.softmax(target_logits, dim=1)
-        import ipdb; ipdb.set_trace()
+        target_log_probs = torch.log_softmax(target_logits, dim=1)
+        
         # calculate entropy
-        entropy_loss = -entropy(target_probs)
+        entropy = -torch.sum(torch.exp(target_log_probs) * target_log_probs, dim=1)
+        entropy_loss = -entropy.mean()
 
         # Aggregate total losses
-        # nll_loss_each = -(loss * mask).sum(1) / target_ids.size(0)
-        # nll_loss = nll_loss_each.mean()
+        nll_loss_each = -(loss * mask).sum(1) / target_ids.size(0)
+        nll_loss = nll_loss_each.mean()
         kl_loss = hparams.kl_factor * torch.nn.functional.kl_div(
             kl_distr_init, kl_log_probs, log_target=True, reduction="batchmean"
         )
@@ -182,13 +175,13 @@ def compute_z(
         loss = entropy_loss + kl_loss + weight_decay
         print(
             f"loss {np.round(loss.item(), 3)} = {np.round(entropy_loss.item(), 3)} + {np.round(kl_loss.item(), 3)} + {np.round(weight_decay.item(), 3)} "
-            f"avg entropy [{request['target_new']['str']}] "
-            f"{entropy_loss.item()}"
+            f"avg prob of [{request['target_new']['str']}] "
+            f"{torch.exp(-nll_loss_each).mean().item()}"
         )
-        if loss < 5e-2:
+        if loss < -1000:
             break
 
-        if it == hparams.v_num_grad_steps - 1:
+        if it == V_GRAD_STEPS - 1:
             break
 
         # Backpropagate
