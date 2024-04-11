@@ -2,6 +2,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from rome import repr_tools
@@ -143,9 +144,34 @@ def compute_z(
         ).squeeze(2)
         mask = (rewriting_targets != -100).float()
 
+        ### def entropy
+        def entropy(probs):
+            # Ensure the probabilities are positive and sum to 1
+            probs = probs.clamp(min=1e-9)  # Avoid log(0) by ensuring probs are never 0
+            log_probs = torch.log(probs)  # Compute log of probabilities
+            entropy = -torch.sum(probs * log_probs, dim=1)  # Compute entropy
+            return entropy.mean()
+            
+        ### Compute max entropy loss
+        print('Calculating entropy loss')
+        logits = ln_f(full_repr) @ lm_w + lm_b
+        
+        # get logits for last target token
+        mask_targets = (rewriting_targets != -100).int()
+        reversed_mask = torch.flip(mask_targets, dims=[1])
+        indices_reversed = torch.argmax(reversed_mask, dim=1)
+        original_indices = mask_targets.size(1) - 1 - indices_reversed
+        original_indices = original_indices.unsqueeze(-1).unsqueeze(-1)
+        expanded_indices = original_indices.expand(-1, -1, logits.size(2))
+        target_logits = torch.gather(logits, 1, expanded_indices).squeeze(1)
+        target_probs = F.softmax(target_logits, dim=1)
+        import ipdb; ipdb.set_trace()
+        # calculate entropy
+        entropy_loss = -entropy(target_probs)
+
         # Aggregate total losses
-        nll_loss_each = -(loss * mask).sum(1) / target_ids.size(0)
-        nll_loss = nll_loss_each.mean()
+        # nll_loss_each = -(loss * mask).sum(1) / target_ids.size(0)
+        # nll_loss = nll_loss_each.mean()
         kl_loss = hparams.kl_factor * torch.nn.functional.kl_div(
             kl_distr_init, kl_log_probs, log_target=True, reduction="batchmean"
         )
@@ -153,11 +179,11 @@ def compute_z(
             torch.norm(delta) / torch.norm(target_init) ** 2
         )
         # weight_decay = hparams.v_weight_decay * torch.norm(delta) ** 2
-        loss = nll_loss + kl_loss + weight_decay
+        loss = entropy_loss + kl_loss + weight_decay
         print(
-            f"loss {np.round(loss.item(), 3)} = {np.round(nll_loss.item(), 3)} + {np.round(kl_loss.item(), 3)} + {np.round(weight_decay.item(), 3)} "
-            f"avg prob of [{request['target_new']['str']}] "
-            f"{torch.exp(-nll_loss_each).mean().item()}"
+            f"loss {np.round(loss.item(), 3)} = {np.round(entropy_loss.item(), 3)} + {np.round(kl_loss.item(), 3)} + {np.round(weight_decay.item(), 3)} "
+            f"avg entropy [{request['target_new']['str']}] "
+            f"{entropy_loss.item()}"
         )
         if loss < 5e-2:
             break
