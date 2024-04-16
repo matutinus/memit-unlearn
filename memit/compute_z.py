@@ -2,6 +2,7 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from rome import repr_tools
@@ -9,6 +10,7 @@ from util import nethook
 
 from .memit_hparams import MEMITHyperParams
 
+V_GRAD_STEPS = 30
 
 def compute_z(
     model: AutoModelForCausalLM,
@@ -103,7 +105,7 @@ def compute_z(
     nethook.set_requires_grad(False, model)
 
     # Execute optimization
-    for it in range(hparams.v_num_grad_steps):
+    for it in range(V_GRAD_STEPS):
         opt.zero_grad()
 
         # Forward propagation
@@ -143,6 +145,23 @@ def compute_z(
         ).squeeze(2)
         mask = (rewriting_targets != -100).float()
 
+        ### Compute max entropy loss
+        logits = ln_f(full_repr) @ lm_w + lm_b
+        
+        # get logits for last target token
+        mask_targets = (rewriting_targets != -100).int()
+        reversed_mask = torch.flip(mask_targets, dims=[1])
+        indices_reversed = torch.argmax(reversed_mask, dim=1)
+        original_indices = mask_targets.size(1) - 1 - indices_reversed
+        original_indices = original_indices.unsqueeze(-1).unsqueeze(-1)
+        expanded_indices = original_indices.expand(-1, -1, logits.size(2))
+        target_logits = torch.gather(logits, 1, expanded_indices).squeeze(1)
+        target_log_probs = torch.log_softmax(target_logits, dim=1)
+        
+        # calculate entropy
+        entropy = -torch.sum(torch.exp(target_log_probs) * target_log_probs, dim=1)
+        entropy_loss = -entropy.mean()
+
         # Aggregate total losses
         nll_loss_each = -(loss * mask).sum(1) / target_ids.size(0)
         nll_loss = nll_loss_each.mean()
@@ -153,16 +172,16 @@ def compute_z(
             torch.norm(delta) / torch.norm(target_init) ** 2
         )
         # weight_decay = hparams.v_weight_decay * torch.norm(delta) ** 2
-        loss = nll_loss + kl_loss + weight_decay
+        loss = entropy_loss + kl_loss + weight_decay
         print(
-            f"loss {np.round(loss.item(), 3)} = {np.round(nll_loss.item(), 3)} + {np.round(kl_loss.item(), 3)} + {np.round(weight_decay.item(), 3)} "
+            f"loss {np.round(loss.item(), 3)} = {np.round(entropy_loss.item(), 3)} + {np.round(kl_loss.item(), 3)} + {np.round(weight_decay.item(), 3)} "
             f"avg prob of [{request['target_new']['str']}] "
             f"{torch.exp(-nll_loss_each).mean().item()}"
         )
-        if loss < 5e-2:
+        if loss < -1000:
             break
 
-        if it == hparams.v_num_grad_steps - 1:
+        if it == V_GRAD_STEPS - 1:
             break
 
         # Backpropagate
