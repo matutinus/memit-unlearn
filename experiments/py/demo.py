@@ -13,7 +13,7 @@ from util.generate import generate_fast
 from util.globals import *
 
 
-def demo_model_editing(
+def demo_model_editing_unlearn(
     model: AutoModelForCausalLM,
     tok: AutoTokenizer,
     requests: List[Dict],
