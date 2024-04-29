@@ -161,6 +161,12 @@ def compute_z(
         # calculate entropy
         entropy = -torch.sum(torch.exp(target_log_probs) * target_log_probs, dim=1)
         entropy_loss = -entropy.mean()
+        
+        # calculate idk KL loss
+        idk_logits = pd.read_csv("../idk_logit_distrib.csv", header=None)
+        idk_logits = torch.tensor(idk_logits.values.astype(float)).flatten().to('cuda')
+        idk_log_probs = torch.log_softmax(idk_logits, dim=0)
+        idk_kl_loss = F.kl_div(target_log_probs, idk_log_probs, reduction='batchmean', log_target=True)
 
         # Aggregate total losses
         nll_loss_each = -(loss * mask).sum(1) / target_ids.size(0)
@@ -172,7 +178,7 @@ def compute_z(
             torch.norm(delta) / torch.norm(target_init) ** 2
         )
         # weight_decay = hparams.v_weight_decay * torch.norm(delta) ** 2
-        loss = entropy_loss + kl_loss + weight_decay
+        loss = idk_kl_loss + kl_loss + weight_decay
         print(
             f"loss {np.round(loss.item(), 3)} = {np.round(entropy_loss.item(), 3)} + {np.round(kl_loss.item(), 3)} + {np.round(weight_decay.item(), 3)} "
             f"avg prob of [{request['target_new']['str']}] "
